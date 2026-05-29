@@ -1,5 +1,5 @@
 """
-SEC 13F Filing Tool
+SEC 13F Filing Tool 
 ====================
 1. Pulls all 13F filing index data between two dates from SEC EDGAR
 2. Launches a GUI (Tkinter) for company selection via text search or index browsing
