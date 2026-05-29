@@ -875,6 +875,7 @@ class App13F(tk.Tk):
         self.index_df: pd.DataFrame = pd.DataFrame()
         self.selected_rows: list[int] = []
         self.portfolio_df: pd.DataFrame = pd.DataFrame()
+        self.portfolio_agg_df: pd.DataFrame = pd.DataFrame()
         self._search_after_id = None
 
         self._ensure_user_agent()
@@ -1222,10 +1223,8 @@ class App13F(tk.Tk):
         result_lines = []
 
         for name in names:
-            # Use the same search as the Text Search tab
-            query = name.lower()
-            mask  = self.index_df["company_name"].str.lower().str.contains(
-                query, na=False, regex=False)
+            # Exact case-insensitive match on company_name
+            mask    = self.index_df["company_name"].str.lower() == name.lower()
             matches = self.index_df[mask]
             count   = 0
             for idx in matches.index:
@@ -1243,7 +1242,7 @@ class App13F(tk.Tk):
         self._refresh_queue_tree()
         self._update_queue_tab_title()
 
-        # Show results in a popup so the editor text is preserved
+        # Show results summary
         result_win = tk.Toplevel(self)
         result_win.title("Search Results")
         result_win.geometry("700x400")
@@ -1399,7 +1398,8 @@ class App13F(tk.Tk):
             # Queue
             "selected_rows":  self.selected_rows,
             # Portfolio
-            "portfolio_df":   self.portfolio_df,
+            "portfolio_df":     self.portfolio_df,
+            "portfolio_agg_df": getattr(self, "portfolio_agg_df", pd.DataFrame()),
             # Watchlist
             "watchlist_text": self.wl_text.get("1.0", "end").rstrip(),
             "watchlist_path": self._watchlist_file_path,
@@ -1465,7 +1465,8 @@ class App13F(tk.Tk):
         self.selected_rows = state.get("selected_rows", [])
 
         # Portfolio
-        self.portfolio_df = state.get("portfolio_df", pd.DataFrame())
+        self.portfolio_df     = state.get("portfolio_df",     pd.DataFrame())
+        self.portfolio_agg_df = state.get("portfolio_agg_df", pd.DataFrame())
 
         # Watchlist
         wl_text = state.get("watchlist_text", "")
@@ -1585,6 +1586,12 @@ class App13F(tk.Tk):
         tk.Entry(flt, textvariable=self.pf_val_max_var,
                  width=10).pack(side="left", padx=(0, 6))
 
+        self._show_new_positions = False
+        self.pf_new_btn = tk.Button(
+            flt, text="🆕 New Positions (latest Q)",
+            command=self._toggle_new_positions,
+            bg="#2980b9", fg="white", padx=6)
+        self.pf_new_btn.pack(side="right", padx=6)
         tk.Button(flt, text="Clear filters",
                   command=self._clear_portfolio_filters,
                   bg="#bdc3c7", padx=6).pack(side="right", padx=6)
@@ -1969,20 +1976,53 @@ class App13F(tk.Tk):
             self._set_status("No portfolio data retrieved.")
             return
 
-        # Compute weight% and store back into portfolio_df
+        # Ensure numeric columns
         df["value_x1000"] = pd.to_numeric(df["value_x1000"], errors="coerce").fillna(0)
+        df["shares"]      = pd.to_numeric(df["shares"],      errors="coerce").fillna(0)
+
+        # ── Aggregate by (filer_name, filing_quarter, form_type, cusip) ──────
+        # This collapses duplicate CUSIP rows from XML+HTML merge into one row.
+        group_keys = [c for c in ("filer_name", "filing_quarter", "form_type",
+                                   "cik", "accepted_dt", "cusip")
+                      if c in df.columns]
+        agg_dict = {
+            "value_x1000":   "sum",
+            "shares":        "sum",
+        }
+        # For text columns take the first non-empty value
+        for col in ("issuer_name", "ticker", "sic", "sic_description",
+                    "share_type", "investmentdiscretion"):
+            if col in df.columns:
+                agg_dict[col] = "first"
+
+        agg = (df.groupby(group_keys, sort=False)
+                  .agg(agg_dict)
+                  .reset_index())
+
+        # Recompute weight% on the aggregated data
+        if "filing_quarter" in agg.columns and "filer_name" in agg.columns:
+            totals = agg.groupby(["filer_name", "filing_quarter"])["value_x1000"].transform("sum")
+            agg["weight_%"] = (agg["value_x1000"] / totals.replace(0, float("nan")) * 100).round(2)
+        else:
+            agg["weight_%"] = float("nan")
+
+        # Also compute weight% on raw df (used by detail popup and time-series)
         if "filing_quarter" in df.columns and "filer_name" in df.columns:
-            totals = df.groupby(["filer_name", "filing_quarter"])["value_x1000"].transform("sum")
-            df["weight_%"] = (df["value_x1000"] / totals.replace(0, float("nan")) * 100).round(2)
+            totals_raw = df.groupby(["filer_name", "filing_quarter"])["value_x1000"].transform("sum")
+            df["weight_%"] = (df["value_x1000"] / totals_raw.replace(0, float("nan")) * 100).round(2)
         else:
             df["weight_%"] = float("nan")
 
+        self.portfolio_agg_df = agg
+
+        n_raw = len(df)
+        n_agg = len(agg)
         self.port_count_label.configure(
-            text=f"{len(df)} holdings across {df['filer_name'].nunique()} filers")
+            text=f"{n_agg} positions ({n_raw} raw rows) across {agg['filer_name'].nunique()} filers")
         self._apply_portfolio_filter()
         self._refresh_overlap_tab()
         self._refresh_stats_tab()
-        self._set_status(f"Done. {len(df)} holdings loaded.")
+        self._set_status(f"Done. {n_agg} aggregated positions from {n_raw} raw rows loaded.")
 
     def _schedule_port_filter(self):
         if self._port_filter_after is not None:
@@ -1994,12 +2034,29 @@ class App13F(tk.Tk):
                     self.pf_wt_min_var, self.pf_wt_max_var,
                     self.pf_val_min_var, self.pf_val_max_var):
             var.set("")
+        self._show_new_positions = False
+        self.pf_new_btn.configure(
+            bg="#2980b9", fg="white",
+            text="🆕 New Positions (latest Q)")
+        self._apply_portfolio_filter()
+
+    def _toggle_new_positions(self):
+        self._show_new_positions = not getattr(self, "_show_new_positions", False)
+        if self._show_new_positions:
+            self.pf_new_btn.configure(bg="#e74c3c", fg="white",
+                                       text="✖ New Positions (latest Q)")
+        else:
+            self.pf_new_btn.configure(bg="#2980b9", fg="white",
+                                       text="🆕 New Positions (latest Q)")
         self._apply_portfolio_filter()
 
     def _apply_portfolio_filter(self):
         self._port_filter_after = None
-        df = self.portfolio_df
-        if df.empty:
+        # Use aggregated DataFrame for display; fall back to raw if agg not yet built
+        df = getattr(self, "portfolio_agg_df", None)
+        if df is None or df.empty:
+            df = self.portfolio_df
+        if df is None or df.empty:
             return
 
         filer  = self.pf_filer_var.get().strip().lower()
@@ -2037,6 +2094,28 @@ class App13F(tk.Tk):
             mask &= v <= val_max
 
         filtered = df[mask].copy()
+
+        # New-positions filter: keep only CUSIPs in the latest quarter
+        # that did not appear in any earlier quarter (per filer)
+        if getattr(self, "_show_new_positions", False) and "filing_quarter" in filtered.columns:
+            def _qtr_key(q):
+                try:
+                    p = q.split()
+                    return (int(p[0]), int(p[1][1:]))
+                except Exception:
+                    return (0, 0)
+            all_qtrs = sorted(filtered["filing_quarter"].dropna().unique(),
+                              key=_qtr_key)
+            if len(all_qtrs) > 1:
+                latest_q  = all_qtrs[-1]
+                prev_qtrs = set(all_qtrs[:-1])
+                latest_df = filtered[filtered["filing_quarter"] == latest_q]
+                prev_df   = filtered[filtered["filing_quarter"].isin(prev_qtrs)]
+                # Per-filer new positions: in latest but not in any prior quarter
+                prev_pairs = set(zip(prev_df["filer_name"], prev_df["cusip"]))
+                new_mask   = latest_df.apply(
+                    lambda r: (r["filer_name"], r["cusip"]) not in prev_pairs, axis=1)
+                filtered = latest_df[new_mask].copy()
 
         # Sort by filing_quarter, filer_name, issuer_name (then form_type if present)
         sort_cols = [c for c in ("filing_quarter", "filer_name", "issuer_name", "form_type")
@@ -2838,7 +2917,8 @@ setInterval(poll, 2000);
 
         import tempfile, webbrowser, json
 
-        df = self.portfolio_df.copy()
+        # Use aggregated DataFrame so each CUSIP appears once per filer/quarter
+        df = getattr(self, "portfolio_agg_df", self.portfolio_df).copy()
 
         # Ensure value_x1000 is numeric
         df["value_x1000"] = pd.to_numeric(df["value_x1000"], errors="coerce").fillna(0)
@@ -2850,13 +2930,16 @@ setInterval(poll, 2000);
         # Ensure filing_quarter column exists
         if "filing_quarter" not in df.columns or df["filing_quarter"].eq("").all():
             df["filing_quarter"] = pd.to_datetime(
-                df["date_filed"], errors="coerce").apply(
+                df.get("date_filed", pd.Series(dtype=str)), errors="coerce").apply(
                 lambda d: f"{d.year} Q{(d.month-1)//3+1}" if pd.notna(d) else "Unknown")
 
-        # Compute weight per (manager, quarter)
-        df["port_total"] = df.groupby(
-            ["filer_name", "filing_quarter"])["value_x1000"].transform("sum")
-        df["weight_pct"] = (df["value_x1000"] / df["port_total"] * 100).round(2)
+        # Weight already computed in portfolio_agg_df; recompute if missing
+        if "weight_%" in df.columns:
+            df["weight_pct"] = df["weight_%"]
+        else:
+            df["port_total"] = df.groupby(
+                ["filer_name", "filing_quarter"])["value_x1000"].transform("sum")
+            df["weight_pct"] = (df["value_x1000"] / df["port_total"] * 100).round(2)
 
         # Build CUSIP → full display name (concatenate unique issuer names)
         # and CUSIP → short label (truncated to 20 chars for x-axis)
@@ -3012,6 +3095,17 @@ setInterval(poll, 2000);
 
 </div>
 
+<div class="ctrl-group" style="flex-direction:row;align-items:center;gap:8px;">
+  <button id="new-pos-btn"
+          onclick="toggleNewPositions()"
+          style="padding:5px 12px;border-radius:4px;border:1px solid #ccc;
+                 background:#2980b9;color:#fff;cursor:pointer;font-size:13px;
+                 white-space:nowrap;">
+    🆕 New Positions (latest Q)
+  </button>
+  <span id="new-pos-info" style="font-size:11px;color:#888;"></span>
+</div>
+
 <div id="status-bar">Ready.</div>
 <div id="chart"></div>
 
@@ -3066,7 +3160,34 @@ function scheduleRedraw() {{
   _timer = setTimeout(redraw, 80);
 }}
 
-let _initialized = false;
+let _initialized    = false;
+let _newPositions   = false;   // true = show only new positions in latest quarter
+
+function toggleNewPositions() {{
+  _newPositions = !_newPositions;
+  const btn = document.getElementById("new-pos-btn");
+  if (_newPositions) {{
+    btn.style.background = "#e74c3c";
+    btn.textContent = "✖ New Positions (latest Q)";
+  }} else {{
+    btn.style.background = "#2980b9";
+    btn.textContent = "🆕 New Positions (latest Q)";
+  }}
+  scheduleRedraw();
+}}
+
+// Compute the latest quarter across all data
+function latestQuarter(groups) {{
+  let best = null;
+  groups.forEach(g => {{
+    if (!best) {{ best = g.qtr; return; }}
+    const [y1,q1] = best.split(" "), [y2,q2] = g.qtr.split(" ");
+    const a = parseInt(y1)*10 + parseInt((q1||"Q0").slice(1));
+    const b = parseInt(y2)*10 + parseInt((q2||"Q0").slice(1));
+    if (b > a) best = g.qtr;
+  }});
+  return best;
+}}
 
 function redraw() {{
   const selQtr      = document.getElementById("qtr-sel").value;
@@ -3112,6 +3233,36 @@ function redraw() {{
       secMgrVis[cusip].add(mgr);
     }}
   }});
+
+  // Step 3b: new-positions filter — keep only CUSIPs in the latest quarter
+  //           that don't appear in any earlier quarter (per visible manager)
+  if (_newPositions) {{
+    const latestQ = latestQuarter(visGroups);
+    // Collect CUSIPs present in any group that is NOT the latest quarter
+    const prevCusips = new Set();
+    visGroups.forEach(g => {{
+      if (g.qtr !== latestQ) {{
+        Object.keys(g.data).forEach(c => prevCusips.add(c));
+      }}
+    }});
+    // Keep only CUSIPs in the latest quarter that are absent from prior quarters
+    const latestCusips = new Set();
+    visGroups.filter(g => g.qtr === latestQ)
+             .forEach(g => Object.keys(g.data).forEach(c => latestCusips.add(c)));
+    const newCusips = new Set([...latestCusips].filter(c => !prevCusips.has(c)));
+    // Remove non-new CUSIPs from secWeight / secMgrVis
+    for (const c of Object.keys(secWeight)) {{
+      if (!newCusips.has(c)) {{
+        delete secWeight[c];
+        delete secMgrVis[c];
+      }}
+    }}
+    const n_new = newCusips.size;
+    document.getElementById("new-pos-info").textContent =
+      latestQ ? latestQ + ": " + n_new + " new position(s)" : "";
+  }} else {{
+    document.getElementById("new-pos-info").textContent = "";
+  }}
 
   // Step 4: overlap / crowding filter (keyed by CUSIP)
   let allowedCusips = Object.keys(secWeight);
